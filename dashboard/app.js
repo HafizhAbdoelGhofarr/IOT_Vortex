@@ -20,7 +20,7 @@
     currentSpeed: 2, // 1: ECO, 2: NORMAL, 3: SPORT
     activeGamepads: {},
     selectedGamepadIndex: null,
-    
+
     // Telemetry Values
     telemetry: {
       distance: 42.5,
@@ -290,8 +290,8 @@
           duration: duration,
           weakMagnitude: weak,
           strongMagnitude: strong
-        }).catch(() => {});
-      } catch (err) {}
+        }).catch(() => { });
+      } catch (err) { }
     }
   }
 
@@ -624,6 +624,16 @@
     }
   }
 
+
+  let commandKeepAliveTimer = null;
+  let telemetryPollTimer = null;
+
+  const MOVEMENT_COMMANDS = [
+    'FORWARD',
+    'BACKWARD',
+    'LEFT',
+    'RIGHT'
+  ];
   // ===================================================================
   // 6. COMMAND DISPATCHER & SAFETY INTERLOCK
   // ===================================================================
@@ -664,7 +674,24 @@
 
     // If live mode, transmit HTTP GET/POST to ESP32
     if (!state.simMode) {
+      if (commandKeepAliveTimer) {
+        clearInterval(commandKeepAliveTimer);
+        commandKeepAliveTimer = null;
+      }
+
       transmitToEsp(cmd, state.currentSpeed);
+
+      // Kirim ulang command gerakan agar tidak terkena timeout
+      if (MOVEMENT_COMMANDS.includes(cmd)) {
+        commandKeepAliveTimer = setInterval(() => {
+          if (
+            !state.simMode &&
+            state.currentCommand === cmd
+          ) {
+            transmitToEsp(cmd, state.currentSpeed);
+          }
+        }, 1000);
+      }
     }
   }
 
@@ -679,20 +706,42 @@
 
   // Transmit command to physical ESP32 via HTTP REST
   async function transmitToEsp(cmd, speed) {
-    const url = `http://${state.espIp}/command?cmd=${cmd}&speed=${speed}`;
+    const url =
+      `http://${state.espIp}/command?cmd=${encodeURIComponent(cmd)}&speed=${speed}`;
+
     try {
       const startT = performance.now();
-      const res = await fetch(url, { method: 'GET', mode: 'cors', cache: 'no-store' });
+
+      const res = await fetch(url, {
+        method: 'GET',
+        cache: 'no-store'
+      });
+
       const ping = Math.round(performance.now() - startT);
       el.pingValue.textContent = `${ping} ms`;
-      if (res.ok) {
-        const json = await res.json();
-        handleTelemetryUpdate(json);
+
+      if (!res.ok) {
+        throw new Error(`HTTP Error: ${res.status}`);
       }
+
+      state.connected = true;
+      el.statusLed.className = 'indicator-led online';
+      el.statusText.textContent = 'ESP32 TERHUBUNG';
+
+      const json = await res.json();
+      handleTelemetryUpdate(json);
+
     } catch (err) {
-      console.warn('ESP32 transmission error:', err);
+      console.error('ESP32 Error:', err);
+
+      state.connected = false;
       el.statusLed.className = 'indicator-led offline';
       el.statusText.textContent = 'ESP32 OFFLINE';
+
+      if (commandKeepAliveTimer) {
+        clearInterval(commandKeepAliveTimer);
+        commandKeepAliveTimer = null;
+      }
     }
   }
 
@@ -926,19 +975,68 @@
     }
 
     // Host IP Connect
-    el.btnConnect.addEventListener('click', () => {
+    // Host IP Connect
+    el.btnConnect.addEventListener('click', async () => {
       const ip = el.espIpInput.value.trim();
-      if (ip) {
-        state.espIp = ip;
+
+      if (!ip) {
+        addLog('Masukkan IP ESP32 terlebih dahulu.', 'WARN');
+        return;
+      }
+
+      state.espIp = ip;
+      el.statusText.textContent = `MENGHUBUNGKAN: ${ip}...`;
+      addLog(`Menguji koneksi ke http://${ip}/telemetry...`, 'SYS');
+
+      try {
+        const res = await fetch(`http://${ip}/telemetry`, {
+          method: 'GET',
+          cache: 'no-store'
+        });
+
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+
+        const data = await res.json();
+
+        // Koneksi berhasil
         state.simMode = false;
+        state.connected = true;
+
         el.btnSimMode.classList.remove('active');
-        el.statusText.textContent = `MENGHUBUNGKAN: ${ip}...`;
-        addLog(`Menghubungkan ke ESP32 pada http://${ip}...`, 'SYS');
+        el.statusText.textContent = 'ESP32 TERHUBUNG';
+
+        if (el.statusLed) {
+          el.statusLed.className = 'indicator-led online';
+        }
+
+        handleTelemetryUpdate(data);
+
+        // Mulai polling telemetry
+        if (telemetryPollTimer) {
+          clearInterval(telemetryPollTimer);
+        }
+
+        telemetryPollTimer = setInterval(pollTelemetry, 1000);
+
+        addLog(`ESP32 berhasil terhubung di ${ip}.`, 'SYS');
         sfx.action();
-        transmitToEsp('STAND', state.currentSpeed);
+
+        sendCommand('STAND');
+
+      } catch (err) {
+        state.connected = false;
+
+        el.statusText.textContent = 'ESP32 OFFLINE';
+
+        if (el.statusLed) {
+          el.statusLed.className = 'indicator-led offline';
+        }
+
+        addLog(`Gagal terhubung ke ESP32: ${err.message}`, 'WARN');
       }
     });
-
     // Stance Buttons
     el.btnStanceStand.addEventListener('click', () => { sendCommand('STAND'); sfx.action(); });
     el.btnStanceCrouch.addEventListener('click', () => { sendCommand('CROUCH'); sfx.action(); });
@@ -958,11 +1056,29 @@
     });
 
     // D-Pad Touch/Click
-    el.btnDpadUp.addEventListener('click', () => sendCommand('FORWARD'));
-    el.btnDpadDown.addEventListener('click', () => sendCommand('BACKWARD'));
-    el.btnDpadLeft.addEventListener('click', () => sendCommand('LEFT'));
-    el.btnDpadRight.addEventListener('click', () => sendCommand('RIGHT'));
-    el.btnDpadStop.addEventListener('click', () => sendCommand('STOP'));
+    function bindMovementButton(button, command) {
+      button.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        sendCommand(command);
+      });
+
+      button.addEventListener('pointerup', () => {
+        sendCommand('STOP');
+      });
+
+      button.addEventListener('pointercancel', () => {
+        sendCommand('STOP');
+      });
+    }
+
+    bindMovementButton(el.btnDpadUp, 'FORWARD');
+    bindMovementButton(el.btnDpadDown, 'BACKWARD');
+    bindMovementButton(el.btnDpadLeft, 'LEFT');
+    bindMovementButton(el.btnDpadRight, 'RIGHT');
+
+    el.btnDpadStop.addEventListener('click', () => {
+      sendCommand('STOP');
+    });
 
     // Speed Slider
     el.speedRange.addEventListener('input', (e) => {
